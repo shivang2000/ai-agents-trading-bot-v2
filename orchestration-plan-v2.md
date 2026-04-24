@@ -2690,3 +2690,341 @@ The $5k account busted, EC2 was terminated to save money, DB + logs lost. Post-m
 - The parser_confidence + channel_id of every signal around the bust window would be intact
 - Paperclip's `deploy_audit` + `ceo_journal` would persist across EC2 churn
 - Re-running the post-mortem SQL from this plan would have given a precise root cause instead of an interview reconstruction
+
+---
+
+## Multi-tenant schema — support multiple systems + propfirms + personal accounts concurrently
+
+**Problem.** Current schema (`trades`, `parsed_signals`, `raw_messages`, `channel_stats`) assumes a single active account. User will run:
+
+- Multiple prop-firm accounts simultaneously (e.g., FP $5k Step 2 + FTM $25k 1-step + FP $100k Master in parallel)
+- Multiple phases (Step 1 / Step 2 / Master) at different stages across different sizes
+- Personal accounts alongside prop firm accounts
+- Multiple bot versions / strategy configurations ("systems") potentially A/B tested
+
+Without `account_id` and `system_id` as first-class dimensions, analytics can't distinguish "Was this trade on $5k Step 2 or $100k Master?" That makes source-quality scoring, per-firm compliance audit, and ladder-progression tracking impossible.
+
+### Target schema (SQLite local + Turso remote, same DDL)
+
+**Reference + lookup tables** (static, seeded from config):
+
+```sql
+CREATE TABLE propfirms (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    slug        TEXT UNIQUE NOT NULL,        -- 'fundingpips', 'ftm', 'ftmo'
+    name        TEXT NOT NULL,
+    rulebook    TEXT,                         -- path to config/propfirms/<slug>.yaml
+    status      TEXT DEFAULT 'active',        -- active | retired
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE brokers (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT UNIQUE NOT NULL,         -- 'FundingPips-Demo', 'FTM-Live', 'Vantage-Live'
+    platform    TEXT NOT NULL,                -- 'mt5' | 'mt4' | 'ctrader'
+    server      TEXT NOT NULL,                -- MT5 server name
+    timezone    TEXT DEFAULT 'UTC',
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE systems (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT UNIQUE NOT NULL,         -- 'bot-v2.1.0-aggressive', 'bot-v2.2.0-smc-only'
+    version     TEXT NOT NULL,
+    config_hash TEXT,                          -- SHA of the overlay config used
+    notes       TEXT,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**Accounts (multi-tenant core):**
+
+```sql
+CREATE TABLE accounts (
+    id                TEXT PRIMARY KEY,        -- 'fp-5k-step1-v2', 'personal-vantage-live', etc.
+    kind              TEXT NOT NULL,           -- 'propfirm' | 'personal' | 'demo'
+    propfirm_id       INTEGER REFERENCES propfirms(id),   -- NULL for personal
+    broker_id         INTEGER NOT NULL REFERENCES brokers(id),
+    size_usd          NUMERIC,
+    variant           TEXT,                     -- '1-step','2-step','instant-funding',NULL for personal
+    phase             TEXT,                     -- 'step1','step2','master',NULL for personal
+    status            TEXT DEFAULT 'pending',   -- pending|active|passed|bust|paused|retired
+    mt5_login         INTEGER,
+    overlay           TEXT,                     -- config overlay name
+    creds_ssm_prefix  TEXT,
+    next_on_pass      TEXT REFERENCES accounts(id),
+    payouts_fund      TEXT REFERENCES accounts(id),
+    activated_at      TIMESTAMP,
+    passed_at         TIMESTAMP,
+    busted_at         TIMESTAMP,
+    created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE account_phases_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id  TEXT NOT NULL REFERENCES accounts(id),
+    prev_phase  TEXT,
+    new_phase   TEXT NOT NULL,
+    prev_status TEXT,
+    new_status  TEXT NOT NULL,
+    reason      TEXT,                           -- 'passed_step1','bust_daily_dd','user_manual',...
+    changed_by  TEXT,                           -- 'management_agent','human','deployment_agent'
+    changed_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE account_equity_snapshots (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id            TEXT NOT NULL REFERENCES accounts(id),
+    balance               NUMERIC,
+    equity                NUMERIC,
+    margin                NUMERIC,
+    free_margin           NUMERIC,
+    margin_level          NUMERIC,
+    open_position_count   INTEGER,
+    daily_pnl             NUMERIC,
+    drawdown_pct          NUMERIC,
+    peak_equity           NUMERIC,
+    captured_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_equity_acct_time ON account_equity_snapshots(account_id, captured_at);
+```
+
+**Signal pipeline (intake stays account-agnostic, fan-out via `signal_executions`):**
+
+```sql
+-- raw_messages + parsed_signals unchanged — a Telegram message is the same
+-- regardless of which accounts consume it.
+
+CREATE TABLE signal_executions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    parsed_signal_id    INTEGER REFERENCES parsed_signals(id),
+    account_id          TEXT NOT NULL REFERENCES accounts(id),
+    system_id           INTEGER REFERENCES systems(id),
+    decision            TEXT NOT NULL,
+        -- 'executed' | 'rejected_risk' | 'rejected_news' | 'rejected_prop_firm'
+        -- | 'rejected_confidence' | 'skipped_foreign' | 'dry_run'
+    decision_reason     TEXT,
+    trade_id            INTEGER REFERENCES trades(id),   -- NULL if not executed
+    evaluated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_sigex_acct ON signal_executions(account_id, evaluated_at);
+CREATE INDEX idx_sigex_signal ON signal_executions(parsed_signal_id);
+```
+
+**Trades (per-account, multi-source):**
+
+```sql
+CREATE TABLE trades (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id          TEXT NOT NULL REFERENCES accounts(id),
+    system_id           INTEGER REFERENCES systems(id),
+    signal_source       TEXT NOT NULL,
+        -- 'telegram' | 'strategy:ema_pullback' | 'strategy:london_breakout'
+        -- | 'strategy:m5_mtf_momentum' | 'manual' | 'paper_replay'
+    parsed_signal_id    INTEGER REFERENCES parsed_signals(id),
+    channel_id          TEXT,                   -- non-NULL if telegram
+    strategy_name       TEXT,                   -- non-NULL if strategy
+    mt5_ticket          INTEGER,
+    magic               INTEGER,                -- 200000 for bot; other/NULL → foreign
+    action              TEXT,
+    symbol              TEXT,
+    volume              REAL,
+    entry_price         REAL,
+    stop_loss           REAL,
+    take_profit         REAL,
+    opened_at           TIMESTAMP,
+    closed_at           TIMESTAMP,
+    close_price         REAL,
+    pnl                 NUMERIC,
+    pnl_pips            NUMERIC,
+    commission          NUMERIC DEFAULT 0,
+    swap                NUMERIC DEFAULT 0,
+    close_reason        TEXT,
+        -- 'tp_hit' | 'sl_hit' | 'manual_close' | 'pre_news_flat'
+        -- | 'prop_firm_guard' | 'foreign_close' | 'friday_auto_close'
+    UNIQUE (account_id, mt5_ticket)             -- tickets are broker-local, not global
+);
+CREATE INDEX idx_trades_acct_opened ON trades(account_id, opened_at);
+CREATE INDEX idx_trades_acct_closed ON trades(account_id, closed_at);
+CREATE INDEX idx_trades_signal_src ON trades(signal_source);
+CREATE INDEX idx_trades_magic ON trades(magic);
+```
+
+**Risk + audit (per-account):**
+
+```sql
+CREATE TABLE risk_events (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id          TEXT NOT NULL REFERENCES accounts(id),
+    system_id           INTEGER REFERENCES systems(id),
+    kind                TEXT NOT NULL,
+        -- 'rule_violation' | 'rule_warning' | 'prop_firm_breach'
+        -- | 'news_blocked' | 'drawdown_tier_triggered'
+        -- | 'foreign_position_detected' | 'pre_news_flat_executed'
+    limit_name          TEXT,                   -- 'max_daily_loss_pct', 'news_window', etc.
+    limit_value         NUMERIC,
+    current_value       NUMERIC,
+    message             TEXT,
+    related_trade_id    INTEGER REFERENCES trades(id),
+    related_signal_id   INTEGER REFERENCES parsed_signals(id),
+    occurred_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_risk_acct_time ON risk_events(account_id, occurred_at);
+
+CREATE TABLE account_daily (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id        TEXT NOT NULL REFERENCES accounts(id),
+    date              DATE NOT NULL,
+    opening_equity    NUMERIC,
+    closing_equity    NUMERIC,
+    daily_pnl         NUMERIC,
+    daily_pnl_pct     NUMERIC,
+    trade_count       INTEGER,
+    winning_count     INTEGER,
+    losing_count      INTEGER,
+    max_drawdown_pct  NUMERIC,
+    biggest_win       NUMERIC,
+    biggest_loss      NUMERIC,
+    rules_violated    TEXT,                    -- JSON list
+    UNIQUE (account_id, date)
+);
+```
+
+**Channel stats (per-account-phase + global roll-up):**
+
+```sql
+CREATE TABLE channel_stats (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id        TEXT NOT NULL,
+    account_id        TEXT REFERENCES accounts(id),    -- NULL = global roll-up
+    total_signals     INTEGER DEFAULT 0,
+    executed_signals  INTEGER DEFAULT 0,
+    winning_trades    INTEGER DEFAULT 0,
+    losing_trades     INTEGER DEFAULT 0,
+    total_pnl         NUMERIC DEFAULT 0,
+    win_rate          NUMERIC DEFAULT 0,
+    expectancy        NUMERIC DEFAULT 0,
+    avg_pnl           NUMERIC DEFAULT 0,
+    sample_size       INTEGER,
+    last_updated      TIMESTAMP,
+    UNIQUE (channel_id, account_id)
+);
+```
+
+**Bot state (Diff 8) becomes per-account:**
+
+```sql
+CREATE TABLE bot_state (
+    account_id  TEXT NOT NULL REFERENCES accounts(id),
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,                 -- JSON
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (account_id, key)
+);
+```
+
+### Runtime implications
+
+**Single-active (P1):** exactly one `accounts` row has `status='active'` at a time. Bot reads its `ACCOUNT_ID` env var on startup (from `CONFIG_OVERLAY` or explicit SSM param), scopes every query with `WHERE account_id = ?`.
+
+**Multi-active (P2):** fleet pattern — one bot container per active account. Compose fleet overlay:
+
+```yaml
+# docker-compose.fleet.override.yml (P2)
+services:
+  mt5-fp-5k-step2:
+    extends: { service: metatrader5 }
+    container_name: mt5-fp-5k-step2
+    ports: ["8081:8001", "8181:3000"]
+
+  bot-fp-5k-step2:
+    extends: { service: trading-bot }
+    container_name: bot-fp-5k-step2
+    environment:
+      - ACCOUNT_ID=fp-5k-step2-v1
+      - MT5_HOST=mt5-fp-5k-step2
+      - CONFIG_OVERLAY=fundingpips-5k-step2
+
+  mt5-ftm-25k:
+    extends: { service: metatrader5 }
+    container_name: mt5-ftm-25k
+    ports: ["8082:8001", "8182:3000"]
+
+  bot-ftm-25k:
+    extends: { service: trading-bot }
+    container_name: bot-ftm-25k
+    environment:
+      - ACCOUNT_ID=ftm-25k-1step-v1
+      - MT5_HOST=mt5-ftm-25k
+      - CONFIG_OVERLAY=ftm-25k-1step-eval
+```
+
+All fleet members share the Turso warm tier (DB writes tagged by `account_id`). Telegram listener: run per-bot with `UNIQUE(channel_id, message_id)` on `raw_messages` so only the first writer wins; others skip insert, parse from the shared row.
+
+### Code-side changes (P1)
+
+- `TrackingDB.__init__(account_id: str, system_id: int, ...)` — stamps every insert.
+- All `SELECT` queries that aggregate are scoped: `WHERE account_id = ?`.
+- New DAO methods:
+  - `record_signal_execution(parsed_signal_id, decision, reason, trade_id=None)` — fills `signal_executions` regardless of outcome. Makes every decision auditable.
+  - `record_risk_event(kind, limit_name, limit_value, current_value, ...)` — auto-called from `RiskManager._validate_risk_limits` on every rejection (not only breaches).
+  - `snapshot_equity()` — called every 5 min by `PositionMonitor`, writes to `account_equity_snapshots`.
+  - `roll_daily(account_id, date)` — called at 00:00 UTC, aggregates the day into `account_daily`.
+- `RiskManager` now reads rulebook from `propfirms.rulebook` via `accounts.propfirm_id`, not hardcoded constants.
+
+### Sample cross-account queries (why this schema matters)
+
+```sql
+-- "How did channel yoforexgold perform on Step 1 accounts across all firms?"
+SELECT a.propfirm_id, a.phase, cs.win_rate, cs.expectancy, cs.sample_size
+FROM channel_stats cs
+JOIN accounts a ON cs.account_id = a.id
+WHERE cs.channel_id = '-1001234567890'    -- yoforexgold
+  AND a.phase = 'step1'
+ORDER BY a.propfirm_id, cs.expectancy DESC;
+
+-- "Aggregate daily PnL across all active accounts (personal + all propfirm) today"
+SELECT a.kind, a.propfirm_id, SUM(t.pnl) AS pnl
+FROM trades t
+JOIN accounts a ON t.account_id = a.id
+WHERE date(t.closed_at) = date('now')
+GROUP BY a.kind, a.propfirm_id;
+
+-- "Which system version performs best per phase on FundingPips?"
+SELECT t.system_id, a.phase, COUNT(*) AS trades, SUM(t.pnl) AS pnl,
+       SUM(CASE WHEN t.pnl > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS win_rate
+FROM trades t
+JOIN accounts a ON t.account_id = a.id
+JOIN propfirms p ON a.propfirm_id = p.id
+WHERE p.slug = 'fundingpips'
+GROUP BY t.system_id, a.phase
+ORDER BY pnl DESC;
+
+-- "All news-blocked signals that would have been losing trades (counterfactual)"
+SELECT se.evaluated_at, ps.symbol, ps.action, ps.parser_confidence,
+       se.decision_reason
+FROM signal_executions se
+JOIN parsed_signals ps ON se.parsed_signal_id = ps.id
+WHERE se.decision = 'rejected_news'
+ORDER BY se.evaluated_at DESC
+LIMIT 100;
+```
+
+### Migration strategy
+
+Because the local DB is empty (the $5k account's data was lost), **clean rebuild with new schema, no backfill needed.** First run of the bot on the refreshed DB seeds:
+
+1. `brokers` — from config
+2. `propfirms` — from `config/propfirms/*.yaml`
+3. `systems` — auto-detect at bot startup, inserting a row keyed on `(name, version, config_hash)` if missing
+4. `accounts` — one row per entry in `config/accounts.yaml`
+
+Migration script `scripts/init_multi_tenant_schema.sql` applied during P1 bootstrap — included in Diff 8 PR.
+
+### Safety-gate additions (Spec 6 appendix)
+
+- [ ] Schema applied: `.tables` shows `accounts`, `systems`, `signal_executions`, `risk_events`, `account_daily`, `account_equity_snapshots`
+- [ ] Every new `trades` row has non-NULL `account_id` and `signal_source` (query: `SELECT COUNT(*) FROM trades WHERE account_id IS NULL OR signal_source IS NULL` → 0)
+- [ ] Every new `signal_executions` row has a `decision` in the allowed enum
+- [ ] `account_equity_snapshots` populated at ≥ 5 min cadence (`SELECT MAX(captured_at), MIN(captured_at), COUNT(*) FROM account_equity_snapshots WHERE account_id = '<current>'`)
+- [ ] Sample cross-account query runs from laptop against Turso: `SELECT a.kind, COUNT(*) FROM trades t JOIN accounts a ON t.account_id = a.id GROUP BY a.kind`
