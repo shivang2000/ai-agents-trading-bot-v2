@@ -1,0 +1,7 @@
+{
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/Users/shivang/.claude/projects/-Users-shivang-dev-advanced-trading-bot-ai-agents-trading-bot-v2/2e003a9d-5178-4f29-9d8b-a3fa1960b9bc/tool-results/b0s29nhse.txt\",\"offset\":0,\"limit\":5000}",
+  "error": "File content (90879 tokens) exceeds maximum allowed tokens (25000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
+  "timestamp": "2026-04-24T03:56:22.562Z",
+  "retry_count": 2
+}
