@@ -250,6 +250,226 @@ Storage: 50 GB gp3 ≈ $4/mo · 100 GB gp3 ≈ $8/mo.
 
 ---
 
+## Deployment portability — MacBook + EC2 (user scope expansion)
+
+**Goal:** the system runs identically on either a MacBook (dev, paper, backtests) or EC2 (live funded trading). One codebase, two compose profiles, no forks.
+
+**Principle:** keep bot + paperclip containers platform-agnostic. Let the *host* environment differ via docker-compose overrides + a thin secrets-loader shim. The bot code sees env vars either way.
+
+### File layout
+
+```
+trading-bot-v2/
+├── docker-compose.yml                       # NEW — base stack (portable)
+├── docker-compose.ec2.override.yml          # refactor of existing ec2.yml
+├── docker-compose.macbook.override.yml      # NEW — Mac-only bits
+├── docker-compose.paperclip.override.yml    # portable, works on both
+├── scripts/
+│   ├── run.sh                               # NEW — platform-detect launcher
+│   ├── bootstrap-ec2.sh                     # existing (Spec 1)
+│   └── bootstrap-mac.sh                     # NEW — Homebrew + Docker Desktop + Caffeine
+└── src/config/secrets.py                    # NEW — env-var-first loader
+```
+
+### `docker-compose.yml` (base — portable)
+
+```yaml
+services:
+  metatrader5:
+    image: gmag11/metatrader5_vnc:latest
+    restart: unless-stopped
+    ports:
+      - "${MT5_NOVNC_PORT:-8080}:3000"
+      - "${MT5_RPYC_PORT:-8001}:8001"
+    environment:
+      - VNC_PASSWORD=${VNC_PASSWORD}
+    volumes:
+      - ${DATA_DIR}/mt5_data:/config/.wine
+
+  trading-bot:
+    build: .
+    restart: unless-stopped
+    depends_on: [metatrader5]
+    env_file: [.env]
+    environment:
+      - MT5_HOST=metatrader5
+      - MT5_PORT=8001
+      - CONFIG_OVERLAY=${CONFIG_OVERLAY}
+    volumes:
+      - ./config:/app/config:ro
+      - ${DATA_DIR}/bot:/app/data
+      - ${LOG_DIR}/bot:/app/logs
+```
+
+### `docker-compose.ec2.override.yml`
+
+```yaml
+services:
+  metatrader5:
+    platform: linux/amd64
+    deploy:
+      resources:
+        limits: { memory: 768M }
+  trading-bot:
+    deploy:
+      resources:
+        limits: { memory: 512M }
+    healthcheck:
+      test: ["CMD", "sh", "/app/scripts/healthcheck.sh"]
+      interval: 60s
+```
+
+### `docker-compose.macbook.override.yml`
+
+```yaml
+services:
+  metatrader5:
+    platform: linux/amd64   # Rosetta 2 on Apple Silicon, native on Intel
+    deploy:
+      resources:
+        limits: { memory: 1.2G }   # slack for emulation overhead
+  trading-bot:
+    deploy:
+      resources:
+        limits: { memory: 768M }
+    stdin_open: true
+    tty: true
+```
+
+### `scripts/run.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$(uname -s)" in
+  Darwin)
+    export DATA_DIR="${DATA_DIR:-$HOME/trading-bot-v2/data}"
+    export LOG_DIR="${LOG_DIR:-$HOME/trading-bot-v2/logs}"
+    OVERRIDE=docker-compose.macbook.override.yml
+    ;;
+  Linux)
+    export DATA_DIR="${DATA_DIR:-/home/ec2-user/trading-bot-v2/data}"
+    export LOG_DIR="${LOG_DIR:-/home/ec2-user/trading-bot-v2/logs}"
+    OVERRIDE=docker-compose.ec2.override.yml
+    ;;
+  *) echo "Unsupported: $(uname -s)"; exit 1 ;;
+esac
+
+mkdir -p "$DATA_DIR/bot" "$DATA_DIR/mt5_data" "$LOG_DIR/bot"
+
+exec docker compose \
+  -f docker-compose.yml \
+  -f "$OVERRIDE" \
+  -f docker-compose.paperclip.override.yml \
+  "$@"
+```
+
+Usage: `./scripts/run.sh up -d` on either platform. Same command, correct stack.
+
+### `src/config/secrets.py` — platform-agnostic secrets
+
+```python
+"""Secrets resolution — same code path on Mac (.env) and EC2 (SSM-injected env vars).
+
+Both platforms: secrets are just env vars at runtime. What DIFFERS is how they
+get INTO env:
+  - Mac: `docker compose` reads .env directly
+  - EC2: systemd drop-in runs `aws ssm get-parameters-by-path /trading-bot/<acct>/`
+         at boot, writes to /etc/trading-bot-overlay.env, compose reads that
+
+The bot is oblivious. This is the single point of access.
+"""
+import os
+
+def get_secret(name: str, default: str | None = None) -> str:
+    value = os.environ.get(name, default)
+    if value is None:
+        raise KeyError(
+            f"Missing secret: {name}. "
+            f"Set in .env (Mac) or SSM /trading-bot/<account>/{name.lower()} (EC2)."
+        )
+    return value
+```
+
+No AWS SDK in the bot itself — secrets injection is the host's responsibility.
+
+### `scripts/bootstrap-mac.sh`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Homebrew
+command -v brew >/dev/null || \
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+# Core tools (caffeine via cask)
+brew install python@3.12 node git jq awscli
+brew install --cask caffeine docker
+
+# Start Docker Desktop if not already
+open -a Docker || true
+echo "Docker Desktop — settings: Resources → Memory ≥ 6 GB, CPUs ≥ 4"
+
+# Python env
+python3.12 -m venv ~/.venvs/trading-bot-v2
+source ~/.venvs/trading-bot-v2/bin/activate
+pip install -e '.[dev]'
+
+# Claude Code CLI (same binary as EC2)
+npm install -g @anthropic-ai/claude-code
+
+cat <<'EOF'
+==> Done. Remaining manual steps:
+  1. Open Caffeine from menu bar, turn it ON (☕)
+  2. System Settings → Lock Screen → "Turn display off": Never
+  3. Power: plugged in during trading hours
+  4. claude login  (OAuth browser flow)
+  5. cp .env.example .env ; fill in secrets
+  6. ./scripts/run.sh up -d
+EOF
+```
+
+### What's different per platform
+
+| Concern | MacBook | EC2 |
+|---|---|---|
+| Secrets source | `.env` (chmod 600, gitignored) | SSM Parameter Store → systemd drop-in → env |
+| Storage root | `$HOME/trading-bot-v2/data` | `/home/ec2-user/trading-bot-v2/data` (EBS) |
+| Backup | Time Machine + optional manual S3 | systemd timer nightly S3 sync |
+| Sleep prevention | **Caffeine** (☕ menu bar, plugged in) | N/A |
+| Platform emulation | Rosetta 2 for MT5 (Apple Silicon) | Native x86 |
+| Public ingress | None — Tailscale only | Tailscale only after bootstrap |
+| Deploy on change | `git pull && ./scripts/run.sh restart` | GHA self-hosted runner auto-deploys |
+| GHA runner | Not installed | Installed |
+| Best use | Dev · tests · backtests · paper replay | Live funded trading |
+
+### Explicit recommendation despite portability
+
+The system **runs** on MacBook. The system **should not run live funded accounts** on MacBook — laptop sleep / reboot / network-switch mid-open-position = busted account. Caffeine prevents sleep, not security updates or network transitions or physical mobility.
+
+**Use MacBook for:**
+- Fast dev loop (edit → `pytest` → commit)
+- Backtest sweeps (`python scripts/backtest_*.py` — no Docker needed)
+- Paper replay (`dry_run: true`, Caffeine on)
+- Full-stack integration testing before EC2 deploy
+- Post-incident offline debugging
+
+**Use EC2 exclusively for:**
+- Live funded-account trading (Step 1 / Step 2 / Master)
+- 24/7 paperclip agents
+- Anything tied to real money or prop-firm reputation
+
+### Plan deltas baked elsewhere
+
+- Artifact 2 splits into `bootstrap-ec2.sh` (existing) + `bootstrap-mac.sh` (new).
+- Artifact 3 (CI workflows) runs the same tests on both; only `deploy.yml` is EC2-specific.
+- Spec 4 (`docker-compose.paperclip.yml`) becomes `docker-compose.paperclip.override.yml` — identical content, new name.
+- Spec 6 safety-gate gains: "Live trading happens on EC2, not MacBook. Confirm `CONFIG_OVERLAY` loaded on EC2 AND MacBook bot is STOPPED (to avoid dual-bot account interference)."
+
+---
+
 ## Files to create / modify (critical paths)
 
 **New (paperclip side, all under `/Users/shivang/dev/advanced-trading-bot/trading-bot-v2/`):**
