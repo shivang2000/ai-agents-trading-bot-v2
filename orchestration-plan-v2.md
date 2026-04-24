@@ -2552,3 +2552,141 @@ Signal dedup at the handler level is already implicit via the `raw_messages.mess
 - [ ] **Closed-while-down drill:** open position, `docker compose stop trading-bot`, manually close the position on MT5 via noVNC, `docker compose start trading-bot`, verify `PositionClosedEvent` emitted and DB `closed_at` populated within 60s
 - [ ] **Telegram gap drill:** stop bot, send a test signal in a connected channel, restart, verify signal appears in `raw_messages` with correct `message_id` and is either processed or explicitly logged as "skipped due to staleness"
 - [ ] `_daily_trade_count`, `_session_start_equity`, `_peak_equity` all readable in `bot_state.value` after 1 hour of live running
+
+---
+
+## Long-term data persistence — two tiers + cold backup (user scope expansion)
+
+**Problem.** Local SQLite on the bot's host is fast but fragile. Losing it — like the terminated EC2 with the $5k account's entire history — loses every trade, lesson, kb_note, and source quality score. S3 nightly snapshots cover disaster recovery but aren't queryable without Athena (expensive, slow). We need a **warm, queryable, remote** tier for long-term history that survives any single host failure.
+
+**Pattern — three tiers:**
+
+```
+┌─ HOT (local, low-latency, critical path) ─────────────┐
+│  bot      → SQLite  (data/trading_bot_v2.db)           │
+│  paperclip → PGlite (paperclip-data/paperclip.db)      │
+└───────────────────────────────────────────────────────┘
+                      │ background replication / direct-connect
+                      ▼
+┌─ WARM (remote, queryable from anywhere, ~20–80ms) ────┐
+│  bot history       → Turso libSQL  (free tier, 9 GB)   │
+│  paperclip ops log → Railway Postgres  ($5–10/mo)      │
+└───────────────────────────────────────────────────────┘
+                      │ nightly export + hourly WAL
+                      ▼
+┌─ COLD (S3, disaster recovery, $0.05/mo) ──────────────┐
+│  aws s3 sync {data,logs,paperclip-data} → bucket       │
+└───────────────────────────────────────────────────────┘
+```
+
+### Store selection
+
+| Store | Our-scale cost | Latency | Schema | Fit |
+|---|---|---|---|---|
+| **Turso libSQL** (bot) | **$0** (free: 9 GB / 1 B reads / 25 M writes per month) | 20–60 ms (edge) | SQLite — zero migration | Embedded-replica mode: bot writes local SQLite, lib replicates to cloud async. Zero critical-path dependency on remote. |
+| **Railway Postgres** (paperclip) | **$5–10/mo** for 10 GB | 50–100 ms | Standard Postgres | Paperclip already speaks Postgres (PGlite). Swap connection string. User flagged Railway explicitly. |
+| Neon serverless | Free (scale-to-zero) | Cold-start ~1s after idle | Postgres | Cold-start lag breaks 5-min heartbeat agents — skip. |
+| AWS RDS `t4g.micro` | $15/mo + storage | 20–40 ms (same AZ) | Postgres | Overkill for P1; revisit in P2 when data grows. |
+| DynamoDB | $0.25/GB + RCU/WCU | ~10 ms | NoSQL | Schema rewrite not worth it. Skip. |
+
+**Recommendation:** Turso for bot (free forever at our scale), Railway Postgres for paperclip ($5–10/mo). Total uplift over the current $64 plan: **+$5–10/mo for always-queryable long-term history**.
+
+### Bot migration — minimal code change
+
+`src/tracking/database.py` swaps aiosqlite for libsql-client with embedded-replica mode:
+
+```python
+# src/tracking/database.py
+import os
+import libsql_client
+
+class TrackingDB:
+    def __init__(self) -> None:
+        self._client = libsql_client.create_client_sync(
+            url=os.environ["TURSO_DB_URL"],           # libsql://<you>.turso.io
+            auth_token=os.environ["TURSO_AUTH_TOKEN"],
+            # Embedded replica: bot writes a local SQLite file AND pushes to cloud async.
+            # If cloud is unreachable, writes buffer locally and catch up on reconnect.
+            sync_url=f"file:{os.environ.get('DATA_DIR', 'data')}/trading_bot_v2.db",
+            sync_interval=30,  # push every 30s
+        )
+```
+
+All existing SQL stays the same. Schema unchanged. `data/trading_bot_v2.db` still lives on disk (that's the embedded replica), but a background thread pushes writes to Turso every 30s. Remote failure = graceful degrade to local-only.
+
+### Paperclip migration
+
+`docker-compose.paperclip.override.yml`:
+
+```yaml
+paperclip:
+  environment:
+    - PAPERCLIP_DB_URL=postgresql://user:pass@containers-us-west-XX.railway.app:5432/paperclip
+  # remove the paperclip-data bind mount volume — PGlite no longer needed
+```
+
+One-time migration from PGlite to Railway:
+
+```bash
+# On EC2, after Railway DB is provisioned and paperclip container is down:
+pg_dump "postgresql://pglite-local" > /tmp/paperclip-init.sql
+psql "$RAILWAY_DB_URL" < /tmp/paperclip-init.sql
+```
+
+From then on, paperclip agents read/write Railway directly. 50ms latency per query × ~10 queries per heartbeat = 500ms — negligible for a 5-min schedule.
+
+### Env var additions
+
+`.env.example`:
+
+```
+# Warm-tier bot DB (Turso)
+TURSO_DB_URL=libsql://<you>.turso.io
+TURSO_AUTH_TOKEN=<generated>
+
+# Warm-tier paperclip DB (Railway)
+RAILWAY_DB_URL=postgresql://user:pass@containers-us-west-XX.railway.app:5432/paperclip
+```
+
+SSM mirror on EC2:
+
+```bash
+aws ssm put-parameter --name /trading-bot/common/turso_db_url --value "libsql://..." --type String
+aws ssm put-parameter --name /trading-bot/common/turso_auth_token --value "..." --type SecureString
+aws ssm put-parameter --name /trading-bot/common/railway_db_url --value "postgresql://..." --type SecureString
+```
+
+### Failure modes
+
+- **Turso down** → libSQL embedded replica keeps bot writing to local SQLite, buffers replication, resumes on reconnect. Bot unaffected.
+- **Railway down** → Paperclip agents' DB writes fail; agents log and pause writes with backoff. Bot is on an independent store, unaffected. Slack alert if Railway unreachable > 15m.
+- **Both warm stores down + local disk corrupts** → restore from S3 nightly snapshot (RPO = 24h). WAL-hourly incremental restore reduces RPO to 1h.
+- **EC2 terminated again** → warm tier has the full history; spin up a replacement box, point at Turso + Railway, done. This is the single biggest win.
+
+### Cost summary
+
+| Line item | Monthly |
+|---|---|
+| EC2 t3.large + 50 GB gp3 | $64 |
+| Turso (bot warm tier) | $0 (free forever at our scale) |
+| Railway Postgres (paperclip warm tier) | $5–10 |
+| S3 cold backup (~5 GB) | $0.05 |
+| **Total** | **$69–74** |
+
+### Gate additions (safety-gate Spec 6)
+
+- [ ] Turso DB created, `TURSO_DB_URL` + `TURSO_AUTH_TOKEN` in SSM (EC2) / `.env` (Mac)
+- [ ] Embedded-replica sync verified: INSERT a test row in local SQLite, confirm within 60s via `turso db shell <db> "SELECT * FROM trades ORDER BY id DESC LIMIT 1"`
+- [ ] Railway Postgres provisioned, paperclip pointed at it, first agent heartbeat wrote to remote
+- [ ] `psql $RAILWAY_DB_URL -c "SELECT count(*) FROM kb_notes"` works from laptop — proves remote accessibility without SSHing to EC2
+- [ ] Simulated remote-down test: block egress to Turso for 5m, verify bot continues writing locally, then unblock and verify catch-up replication
+- [ ] S3 snapshot includes both local SQLite + Turso export + Railway pg_dump nightly
+
+### Why this specifically addresses the $5k bust lesson
+
+The $5k account busted, EC2 was terminated to save money, DB + logs lost. Post-mortem was reduced to user memory. With warm-tier Turso + Railway in place from day 1:
+
+- The trade-by-trade equity curve for the bust would have been queryable from anywhere
+- The parser_confidence + channel_id of every signal around the bust window would be intact
+- Paperclip's `deploy_audit` + `ceo_journal` would persist across EC2 churn
+- Re-running the post-mortem SQL from this plan would have given a precise root cause instead of an interview reconstruction
