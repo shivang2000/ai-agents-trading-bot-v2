@@ -2376,3 +2376,179 @@ All 12 boxes green? **Yes → proceed to purchase. No → fix the reds; do not c
 ```
 
 This file lives in the repo. One copy per purchase, committed to `docs/next-challenge-gates/<YYYY-MM-DD>-<account_id>.md`. That creates a permanent audit trail — if a future account busts, we'll know exactly which gate failed (or wasn't exercised).
+
+---
+
+## State persistence across bot restarts — Diff 8 (P1 gate item)
+
+**Problem.** Several pieces of in-memory state reset on every bot restart (crash, deploy, manual kick). On a funded account this is a correctness + safety bug — daily-loss counter resetting mid-day could breach prop-firm rules undetected.
+
+| In-memory state | Owner | Persists today? | Consequence if reset |
+|---|---|---|---|
+| `_known_tickets` (open positions) | PositionMonitor | ✅ resynced from MT5 at startup | — (safe) |
+| `_daily_trade_count` | RiskManager | ❌ no | counter resets mid-day → limit evaded |
+| `_session_start_equity` | RiskManager | ❌ no | daily-loss math broken after restart |
+| `_peak_equity` | RiskManager | ❌ no | DD math broken; peak can only go up mid-restart |
+| `_pre_news_flat_handled` (Diff 2) | PositionMonitor | ❌ no | pre-news FLAT re-fires for same event, or worse, skips due to edge case |
+| `_foreign_alerted_tickets` (Diff 3) | PositionMonitor | ❌ no | re-alerts on same foreign position every 5 min after restart |
+| PartialProfitManager `_state` | PPM | ❌ no | bot may re-take a partial profit already taken on MT5 (duplicate order) |
+| TrailingStopManager `_highs` | TSM | ❌ no | trailing SL jumps back to entry, closes winners early |
+| Telegram last-seen message id | Telethon session file | ⚠️ verify | signal gap during downtime lost or re-processed |
+| `closed_at IS NULL` trades in DB but position closed on MT5 while bot was down | — | ❌ not reconciled | ghost-open trades in the journal, broken P&L |
+
+### Diff 8.a — `bot_state` table + `BotStateStore`
+
+Schema addition to `data/trading_bot_v2.db`:
+
+```sql
+CREATE TABLE IF NOT EXISTS bot_state (
+  key         TEXT PRIMARY KEY,
+  value       TEXT NOT NULL,               -- JSON-serialized
+  updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Keys used:
+- `risk_counters` → `{session_start_equity, peak_equity, daily_trade_count, daily_reset_at}`
+- `pre_news_handled` → `{events: [ISO8601, ...]}`
+- `foreign_alerted` → `{tickets: [int, ...]}`
+- `partial_profit` → `{"<ticket>": {tp1_hit, tp2_hit, ...}}`
+- `trailing_stop` → `{"<ticket>": {high_water_mark, last_sl}}`
+- `active_account` → `{id: "fp-5k-step1-v2", set_at}`
+
+Loader module `src/persistence/bot_state.py`:
+
+```python
+import json
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+class BotStateStore:
+    """Write-through persistence for in-memory bot state. One row per concern."""
+    def __init__(self, db_path: str | Path) -> None:
+        self._conn = sqlite3.connect(str(db_path), isolation_level=None)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+              key TEXT PRIMARY KEY, value TEXT NOT NULL,
+              updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+
+    def load(self, key: str, default: Any = None) -> Any:
+        row = self._conn.execute(
+            "SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def save(self, key: str, value: Any) -> None:
+        self._conn.execute(
+            "INSERT INTO bot_state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+            "updated_at=CURRENT_TIMESTAMP",
+            (key, json.dumps(value, default=str)))
+```
+
+### Diff 8.b — Wire into the ephemeral owners
+
+Each consumer gets a `state_store: BotStateStore` kwarg. On `__init__`, load state; on every mutation, save.
+
+Example for RiskManager:
+
+```python
+# src/risk/manager.py
+def __init__(self, config, event_bus, ..., state_store: BotStateStore):
+    self._state_store = state_store
+    st = state_store.load("risk_counters", {})
+    self._session_start_equity = st.get("session_start_equity", 0.0)
+    self._peak_equity = st.get("peak_equity", 0.0)
+    self._daily_trade_count = st.get("daily_trade_count", 0)
+    self._daily_reset_at = datetime.fromisoformat(
+        st.get("daily_reset_at", "1970-01-01T00:00:00+00:00"))
+
+def _persist_risk(self) -> None:
+    self._state_store.save("risk_counters", {
+        "session_start_equity": self._session_start_equity,
+        "peak_equity": self._peak_equity,
+        "daily_trade_count": self._daily_trade_count,
+        "daily_reset_at": self._daily_reset_at.isoformat(),
+    })
+
+# Call self._persist_risk() after every mutation inside _validate_risk_limits.
+```
+
+Same pattern for PositionMonitor's two sets (`_pre_news_flat_handled`, `_foreign_alerted_tickets`) and for PartialProfitManager + TrailingStopManager.
+
+### Diff 8.c — Startup reconciliation (new method on PositionMonitor)
+
+Runs ONCE in `start()`, before `_sync_positions()`:
+
+```python
+async def _reconcile_with_mt5(self) -> None:
+    """Detect positions closed while bot was down and emit retroactive events."""
+    db_open = {t["mt5_ticket"]: t for t in await self._db.get_open_trades()}
+    mt5_live = {p.ticket: p for p in await self._mt5.positions_get()}
+
+    # Closed-while-down
+    for ticket in set(db_open) - set(mt5_live):
+        hist = await self._mt5.history_deals_get(ticket=ticket)
+        if not hist:
+            logger.warning(
+                "Ticket %s open in DB but missing from MT5 positions + history", ticket)
+            continue
+        close_deal = max(hist, key=lambda d: d.time)
+        await self._handle_close_from_history(db_open[ticket], close_deal)
+
+    # Foreign (pre-existing, unknown to bot)
+    for ticket in set(mt5_live) - set(db_open):
+        pos = mt5_live[ticket]
+        if not self._is_bot_position(pos):
+            await self._event_bus.publish(
+                ForeignPositionEvent(timestamp=datetime.now(timezone.utc), position=pos))
+
+    # Daily counter rollover after restart crosses midnight UTC
+    st = self._state_store.load("risk_counters", {})
+    last_reset = datetime.fromisoformat(
+        st.get("daily_reset_at", "1970-01-01T00:00:00+00:00"))
+    if last_reset.date() < datetime.now(timezone.utc).date():
+        acct = await self._mt5.account_info()
+        st.update({
+            "daily_trade_count": 0,
+            "session_start_equity": acct.equity,
+            "daily_reset_at": datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0).isoformat(),
+        })
+        self._state_store.save("risk_counters", st)
+```
+
+### Diff 8.d — Telegram cursor on restart
+
+Verify (or add) cursor-from-DB in `src/telegram/listener.py::start()`:
+
+```python
+last_seen = {
+    row["channel_id"]: row["max_msg_id"]
+    for row in await self._db.query(
+        "SELECT channel_id, MAX(message_id) AS max_msg_id "
+        "FROM raw_messages GROUP BY channel_id"
+    )
+}
+# Pass last_seen[channel_id] as `min_id` in Telethon's iter_messages / on NewMessage filter.
+```
+
+Signal dedup at the handler level is already implicit via the `raw_messages.message_id` PK — a re-fired message would fail `INSERT`. The cursor keeps us from reading old history on restart.
+
+### Tests — `tests/integration/test_state_persistence.py`
+
+- Save `risk_counters` with `peak_equity=12000`; restart fixture; assert RiskManager reads `peak_equity=12000`.
+- Open position on mocked MT5; emit Fill; restart; assert `_sync_positions` preserves `_known_tickets`.
+- Close position on mocked MT5 while "bot down"; restart; assert `_reconcile_with_mt5` emits `PositionClosedEvent` and updates DB `closed_at`.
+- `_pre_news_flat_handled` survives restart.
+- `_foreign_alerted_tickets` survives restart — no re-alert after restart.
+- Daily counter rollover: set `daily_reset_at` to yesterday; restart; assert counter=0, new `session_start_equity` pulled from live account.
+
+### Safety-gate additions (Spec 6 appendix)
+
+- [ ] `bot_state` table exists and populated after first run (`sqlite3 data/trading_bot_v2.db 'SELECT key, updated_at FROM bot_state'`)
+- [ ] **Restart drill on demo:** open a position, `docker compose restart trading-bot`, verify position still tracked + daily counters intact
+- [ ] **Closed-while-down drill:** open position, `docker compose stop trading-bot`, manually close the position on MT5 via noVNC, `docker compose start trading-bot`, verify `PositionClosedEvent` emitted and DB `closed_at` populated within 60s
+- [ ] **Telegram gap drill:** stop bot, send a test signal in a connected channel, restart, verify signal appears in `raw_messages` with correct `message_id` and is either processed or explicitly logged as "skipped due to staleness"
+- [ ] `_daily_trade_count`, `_session_start_equity`, `_peak_equity` all readable in `bot_state.value` after 1 hour of live running
